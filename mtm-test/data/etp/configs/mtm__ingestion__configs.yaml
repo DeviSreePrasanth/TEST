@@ -1,0 +1,38 @@
+# <wave>__<job>__configs.yaml — source configuration for the mtm_ingestion job.
+# Deployed to gs://<composer-bucket>/data/etp/configs/mtm__ingestion__configs.yaml.
+# Referenced from dags/manifests/mtm_manifest.yaml via the job's `config` key.
+# Validated in CI (schema, naming conventions, credential scanning) via amf.cli validate.
+
+job: mtm_ingestion
+domain: mtm
+wave: etp
+runtime: cloud_run_batch
+
+source:
+  type: api
+  connection_id: mtm_source_api
+  base_url: https://api.example.internal/mtm/v1 ##
+  pagination:
+    style: cursor
+    page_size: 500
+  auth:
+    type: secret_manager
+    secret_ref: projects/123/secrets/mtm-source-api-key/versions/latest ##
+
+incremental:
+  enabled: true
+  cursor_field: updated_at
+  lookback_window: "PT1H"
+
+destination:
+  project: mtm-dev-bronze-7b1f
+  dataset: mtm_raw
+
+tables:
+  - name: transactions
+    endpoint: /transactions
+    write_disposition: merge
+    primary_key: [transaction_id]
+  - name: accounts
+    endpoint: /accounts
+    write_disposition: replace

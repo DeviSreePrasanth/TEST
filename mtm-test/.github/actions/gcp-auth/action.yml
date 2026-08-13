@@ -1,0 +1,62 @@
+name: Authenticate to Google Cloud (WIF only)
+description: >
+  Authenticates via Workload Identity Federation and fails if the resulting credentials are
+  anything else. Shared by every workflow so the auth path cannot drift between them.
+
+inputs:
+  workload_identity_provider:
+    description: Full resource name of the WIF provider.
+    required: true
+  service_account:
+    description: Service account email to impersonate.
+    required: true
+  project_id:
+    description: Project to set as the gcloud default.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - id: auth
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ inputs.workload_identity_provider }}
+        service_account: ${{ inputs.service_account }}
+        # Writes an external_account credential file and exports
+        # GOOGLE_APPLICATION_CREDENTIALS. No service-account key is ever created,
+        # downloaded or stored.
+        create_credentials_file: true
+
+    - uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ inputs.project_id }}
+
+    - name: Assert the credentials really are WIF
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Guard against a future edit quietly reintroducing a service-account key: a
+        # `credentials_json` input, or an exported key on the runner, would authenticate
+        # just as happily and nothing downstream would notice. WIF always produces an
+        # `external_account` credential file, so assert on that.
+        if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+          echo "::error::No credentials file was created; WIF authentication did not run."
+          exit 1
+        fi
+
+        CRED_TYPE=$(python3 -c "
+        import json, os
+        with open(os.environ['GOOGLE_APPLICATION_CREDENTIALS']) as fh:
+            print(json.load(fh).get('type', '<none>'))
+        ")
+
+        if [[ "${CRED_TYPE}" != "external_account" ]]; then
+          echo "::error::Expected Workload Identity Federation (external_account) credentials," \
+               "got '${CRED_TYPE}'. Service-account keys are not permitted in this repo."
+          exit 1
+        fi
+
+        ACTIVE=$(gcloud auth list --filter=status:ACTIVE --format="value(account)")
+        echo "Authenticated via WIF as: ${ACTIVE}"

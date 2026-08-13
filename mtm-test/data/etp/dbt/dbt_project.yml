@@ -1,0 +1,41 @@
+# ETP wave dbt Core project.
+# Deployed to gs://<composer-bucket>/data/etp/dbt/.
+#
+# This project is wave-scoped, not domain-scoped: it holds every ETP domain's models
+# (mtm, and others as they onboard), each under its own models/<domain>/ subdirectory and
+# tagged with its domain name. The dag_factory selects a domain's slice via the manifest's
+# `dbt.select` key -- mtm_manifest.yaml uses `tag:mtm`, so the +tags config below is what
+# makes that selector resolve. Do not remove it.
+#
+# NOTE: dbt requires the filename `dbt_project.yml`. structure.md writes it as
+# `dbt_project.yaml`, which dbt-core does not recognise -- the .yml spelling is used here
+# so `dbt parse` / `dbt run` actually work.
+
+name: "etp"
+version: "1.0.0"
+config-version: 2
+
+profile: "etp"
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  etp:
+    +materialized: view
+    mtm:
+      # dbt accumulates tags down the hierarchy, so models under staging/ carry both `mtm`
+      # (the domain-wide selector) and `mtm_ingestion` (the per-job selector the manifest
+      # entry uses). Both must exist: `dbt_selector: tag:x` with no model carrying tag x
+      # runs zero models and still exits 0.
+      +tags: ["mtm"]
+      +schema: mtm_analytics
+      staging:
+        +materialized: view
+        +tags: ["mtm_ingestion"]

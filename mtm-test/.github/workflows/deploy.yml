@@ -1,0 +1,176 @@
+name: Deploy (Dev)
+
+# Push to main: build the etl-mtm wheel, publish it to Artifact Registry, and push the same
+# .whl into the Dev Composer bucket.
+#
+# Per TRD-002 / "everything is a wheel": the wheel carries this repo's DAG manifest YAML and
+# dbt project code as package data (see pyproject.toml's package-dir mapping), so a deploy
+# ships one versioned, rollback-able artifact instead of a scatter of loose files. The
+# dag_factory travels the other path -- published from udp_platform_shared to the same
+# registry and installed as a Composer cluster dependency by Terraform, not by this repo.
+#
+# Every target is a repository variable; nothing here is environment-specific.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "dags/**"
+      - "data/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/deploy.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: etl-mtm-dev-deployment
+  cancel-in-progress: false
+
+env:
+  # TWO different GCP projects are in play. Collapsing them publishes to a registry that
+  # does not exist, or points Composer at the wrong environment:
+  #
+  #   COMPOSER_PROJECT_ID  eo-dev-comp-orch-gl-2540   hosts composer-udp-env + its bucket
+  #   AR_PROJECT_ID        eo-prod-artifact-na-fb1e   hosts the elc-udp-pypi registry
+  #
+  # AR_REGION is the multi-region `us`, not `us-central1` -- the registry hostname is
+  # us-python.pkg.dev. All values come from repository variables; no defaults, so a missing
+  # variable fails the verify step below rather than silently targeting the wrong place.
+  COMPOSER_PROJECT_ID: ${{ vars.COMPOSER_PROJECT_ID }}
+  AR_REGION: ${{ vars.AR_REGION }}
+  AR_PROJECT_ID: ${{ vars.AR_PROJECT_ID }}
+  AR_REPO_NAME: ${{ vars.AR_REPO_NAME }}
+  # Prefix inside the Composer bucket that the wheel is pushed to. Terraform installs the
+  # package from here; deliberately NOT dags/, which Airflow parses for DAG files.
+  WHEEL_PREFIX: ${{ vars.COMPOSER_WHEEL_PREFIX || 'wheels' }}
+
+jobs:
+  deploy:
+    name: Build wheel and publish to Dev
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # setuptools-scm derives the version from tags; a shallow clone yields 0.1.0.dev0.
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud (WIF only)
+        uses: ./.github/actions/gcp-auth
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.COMPOSER_PROJECT_ID }}
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Verify deployment variables
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_variables=(
+            "COMPOSER_PROJECT_ID"
+            "COMPOSER_BUCKET"
+            "AR_PROJECT_ID"
+            "AR_REPO_NAME"
+            "WIF_PROVIDER"
+            "GCP_SERVICE_ACCOUNT"
+          )
+
+          for variable_name in "${required_variables[@]}"; do
+            if [[ -z "${!variable_name:-}" ]]; then
+              echo "::error::Missing required repository variable: ${variable_name}"
+              exit 1
+            fi
+          done
+
+          if [[ "${COMPOSER_PROJECT_ID}" == "${AR_PROJECT_ID}" ]]; then
+            echo "::warning::COMPOSER_PROJECT_ID and AR_PROJECT_ID are identical" \
+                 "(${AR_PROJECT_ID}). The registry normally lives in its own project."
+          fi
+
+          echo "Composer project : ${COMPOSER_PROJECT_ID}"
+          echo "Composer bucket  : gs://${COMPOSER_BUCKET}"
+          echo "Registry         : ${AR_REGION}-python.pkg.dev/${AR_PROJECT_ID}/${AR_REPO_NAME}"
+        env:
+          COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}
+          WIF_PROVIDER: ${{ vars.WIF_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv build --wheel
+
+          WHEEL=$(ls dist/*.whl)
+          echo "WHEEL_PATH=${WHEEL}" >> "$GITHUB_ENV"
+          echo "WHEEL_NAME=$(basename "${WHEEL}")" >> "$GITHUB_ENV"
+          echo "Built ${WHEEL}"
+
+      - name: Assert the wheel carries the manifests and dbt project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A wheel that builds but ships no manifest would deploy silently and generate
+          # zero DAGs, so fail here instead.
+          CONTENTS=$(python -c "import zipfile,sys; print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "${WHEEL_PATH}")
+
+          for required in \
+            "etl_mtm/dags/manifests/mtm_manifest.yaml" \
+            "etl_mtm/data/etp/dbt/dbt_project.yml"
+          do
+            if ! grep -qx "${required}" <<< "${CONTENTS}"; then
+              echo "::error::Wheel is missing ${required}"
+              echo "${CONTENTS}"
+              exit 1
+            fi
+            echo "OK  ${required}"
+          done
+
+      - name: Publish wheel to Artifact Registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pip install --quiet twine keyring keyrings.google-artifactregistry-auth
+          twine upload \
+            --repository-url "https://${AR_REGION}-python.pkg.dev/${AR_PROJECT_ID}/${AR_REPO_NAME}/" \
+            "${WHEEL_PATH}"
+
+      - name: Push wheel to the Composer bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Versioned copy for rollback, plus a stable `latest` pointer Terraform can track.
+          gcloud storage cp "${WHEEL_PATH}" "gs://${COMPOSER_BUCKET}/${WHEEL_PREFIX}/${WHEEL_NAME}"
+          gcloud storage cp "${WHEEL_PATH}" "gs://${COMPOSER_BUCKET}/${WHEEL_PREFIX}/etl_mtm-latest-py3-none-any.whl"
+        env:
+          COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}
+
+      - name: Deployment summary
+        shell: bash
+        run: |
+          {
+            echo "## MTM Dev Deployment"
+            echo ""
+            echo "- Wheel: \`${WHEEL_NAME}\`"
+            echo "- Artifact Registry: \`${AR_REGION}-python.pkg.dev/${AR_PROJECT_ID}/${AR_REPO_NAME}\`"
+            echo "- Composer project: \`${COMPOSER_PROJECT_ID}\`"
+            echo "- Composer bucket: \`gs://${COMPOSER_BUCKET}/${WHEEL_PREFIX}/\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo ""
+            echo "The dag_factory is installed separately as a Composer cluster dependency,"
+            echo "updated by Terraform from the same registry."
+          } >> "${GITHUB_STEP_SUMMARY}"
+        env:
+          COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}

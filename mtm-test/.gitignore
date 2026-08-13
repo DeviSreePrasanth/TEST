@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# dbt (per-wave projects under data/<wave>/dbt/)
+data/*/dbt/target/
+data/*/dbt/dbt_packages/
+data/*/dbt/logs/
+
+# Composer runtime directories: mirrored for layout parity, contents never committed.
+logs/*
+!logs/.gitkeep
+!logs/README.md
+plugins/*
+!plugins/.gitkeep
+!plugins/README.md
+
+# local secrets
+*.env
+.env

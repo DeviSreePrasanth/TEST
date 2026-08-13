@@ -1,0 +1,32 @@
+# Connection profile for the ETP wave dbt project.
+#
+# Every value is env-var driven so the same file works in three places:
+#   - CI (`dbt parse`): defaults below are enough; no BigQuery credentials are needed.
+#   - Cloud Composer: the worker service account's ADC is used (method: oauth).
+#   - Local dev: run `gcloud auth application-default login` first.
+#
+# NOTE: dbt requires the filename `profiles.yml`; structure.md writes `profiles.yaml`,
+# which dbt-core does not recognise. See the note in dbt_project.yml.
+
+etp:
+  target: "{{ env_var('DBT_TARGET', 'dev') }}"
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('DBT_GCP_PROJECT', 'mtm-dev-bronze-7b1f') }}"
+      dataset: "{{ env_var('DBT_DATASET', 'mtm_analytics') }}"
+      location: "{{ env_var('DBT_LOCATION', 'us-central1') }}"
+      threads: 4
+      timeout_seconds: 300
+      priority: interactive
+
+    prod:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('DBT_GCP_PROJECT', 'mtm-prod-bronze') }}"
+      dataset: "{{ env_var('DBT_DATASET', 'mtm_analytics') }}"
+      location: "{{ env_var('DBT_LOCATION', 'us-central1') }}"
+      threads: 8
+      timeout_seconds: 600
+      priority: interactive

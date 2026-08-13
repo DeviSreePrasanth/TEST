@@ -1,0 +1,186 @@
+name: Validate DAGs
+
+# Runs on any PR touching the manifests, the source configs, or the dbt project.
+# Mirrors TRD-002's validation stages: schema validation, DAG factory alignment,
+# dbt parse, and manifest<->config coverage.
+
+on:
+  pull_request:
+    paths:
+      - 'dags/**'
+      - 'data/**'
+      - 'tests/**'
+      - '.github/workflows/validate-dags.yml'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # The shared UDP registry lives in its own artifact project, not the orchestration
+  # project that hosts Composer. Values come from repository variables.
+  AR_REGION: ${{ vars.AR_REGION }}
+  AR_PROJECT_ID: ${{ vars.AR_PROJECT_ID }}
+  AR_REPO_NAME: ${{ vars.AR_REPO_NAME }}
+  COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}
+
+jobs:
+  schema-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Authenticate to Google Cloud (WIF only)
+        uses: ./.github/actions/gcp-auth
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.COMPOSER_PROJECT_ID }}
+
+      - name: Install package + platform validator (amf)
+        run: |
+          uv pip install --system -e ".[dev]"
+          uv pip install --system udp-dag-factory \
+            --index-url "https://${AR_REGION}-python.pkg.dev/${AR_PROJECT_ID}/${AR_REPO_NAME}/simple/"
+
+      - name: Run amf.cli validate
+        run: python -m amf.cli validate data/etp/configs/ dags/manifests/
+
+  dag-factory-alignment:
+    # The point of this job: pull the dag_factory that is ACTUALLY deployed in the Composer
+    # bucket, run it against this repo's manifests, and prove it produces the expected DAGs
+    # -- before the PR merges. Catches factory/manifest drift in CI instead of at Airflow
+    # parse time, where the only symptom is a DAG quietly missing from the UI.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Authenticate to Google Cloud (WIF only)
+        uses: ./.github/actions/gcp-auth
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.COMPOSER_PROJECT_ID }}
+
+      - name: Install package + Airflow
+        run: uv pip install --system -e ".[dev,validation]"
+
+      - name: Fetch the deployed dag_factory from the Composer bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # `gcloud storage` rather than gsutil throughout: gsutil is the older
+          # standalone tool and has a history of not honouring external_account
+          # (WIF) credentials cleanly. gcloud storage uses ADC directly.
+          FACTORY_URI="gs://${COMPOSER_BUCKET}/plugins/dag_factory.py"
+
+          if ! gcloud storage objects describe "${FACTORY_URI}" >/dev/null 2>&1; then
+            echo "Not at plugins/; searching the rest of the bucket..."
+            FACTORY_URI=$(gcloud storage ls --recursive "gs://${COMPOSER_BUCKET}/**" 2>/dev/null \
+              | grep '/dag_factory\.py$' | head -1 || true)
+          fi
+
+          if [[ -z "${FACTORY_URI}" ]]; then
+            echo "::error::No dag_factory.py found anywhere under gs://${COMPOSER_BUCKET}/"
+            exit 1
+          fi
+
+          echo "Using deployed factory: ${FACTORY_URI}"
+
+          # Mirror the bucket: put the factory at the same relative path here as it occupies
+          # there. The factory resolves manifests relative to its own file, so its discovery
+          # then behaves in CI exactly as it does in Composer. Copying to a temp directory
+          # would silently find zero manifests and the job would pass proving nothing.
+          RELATIVE="${FACTORY_URI#gs://${COMPOSER_BUCKET}/}"
+          mkdir -p "$(dirname "${RELATIVE}")"
+          gcloud storage cp "${FACTORY_URI}" "${RELATIVE}"
+
+          echo "FACTORY_URI=${FACTORY_URI}" >> "$GITHUB_ENV"
+          echo "DAG_FACTORY_PATH=${RELATIVE}" >> "$GITHUB_ENV"
+
+      - name: Assert the factory discovers this repo's manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fail loudly on "factory loaded but found nothing", which otherwise looks like a
+          # pass: zero manifests means zero DAGs and zero assertions.
+          python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from etl_mtm import MANIFESTS_DIR, iter_manifests
+
+          manifests = iter_manifests()
+          if not manifests:
+              sys.exit(f"No manifests found in {MANIFESTS_DIR}")
+
+          factory = Path(os.environ["DAG_FACTORY_PATH"])
+          if not factory.is_file():
+              sys.exit(f"dag_factory.py was not placed at {factory}")
+
+          entries = sum(len(m.get("dags") or []) for m in manifests.values())
+          if not entries:
+              sys.exit("Manifests present but they declare no entries under the `dags:` key")
+
+          print(f"Factory   : {factory}")
+          print(f"Manifests : {sorted(manifests)}  ->  {entries} DAG entr(ies)")
+          PY
+
+      - name: Verify the factory builds a DAG per manifest entry
+        # DAG creation happens right here, in CI: the deployed factory is executed against
+        # this repo's manifest and the resulting DAG objects are asserted against it. No
+        # Airflow database is involved -- conftest.py seeds the Variables the factory reads
+        # from AIRFLOW_VAR_* so the parse stays entirely offline.
+        run: pytest tests/test_dag_factory_alignment.py -v
+        env:
+          AIRFLOW_HOME: ${{ runner.temp }}/airflow
+          AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+
+      - name: Alignment report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## DAG Factory alignment"
+            echo ""
+            echo "Factory pulled from \`${FACTORY_URI:-unknown}\`"
+            echo ""
+            echo '```'
+            python scripts/validate_dag_factory.py || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  dbt-compile:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: data/etp/dbt
+    env:
+      DBT_PROFILES_DIR: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install dbt
+        run: uv pip install --system "dbt-bigquery>=1.8"
+      - name: dbt deps
+        run: dbt deps || true
+      - name: dbt parse (config validation only, no BQ credentials required)
+        run: dbt parse
+
+  coverage-report:
+    runs-on: ubuntu-latest
+    needs: [schema-validation, dag-factory-alignment]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install dependencies
+        run: uv pip install --system -e ".[dev]"
+      - name: Manifest <-> config coverage report
+        run: pytest tests/test_configs.py -k "coverage or waves" -v

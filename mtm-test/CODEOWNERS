@@ -1,0 +1,27 @@
+# Per TRD-002 / ADR-006 Decision 2 (SCM Architecture): domain repos are owned by the
+# domain team, with the platform team co-owning DAG manifest entries since they affect
+# the shared dag_factory contract.
+#
+# Paths follow the Composer bucket mirror described in structure.md.
+
+# MTM's own source configs and dbt models.
+data/etp/configs/               @elc-online/udp-mtm-domain-team
+data/etp/dbt/models/mtm/        @elc-online/udp-mtm-domain-team
+
+# Wave-level dbt project files are shared by every ETP domain, so the platform team
+# co-owns them: a change here affects other domains' models.
+data/etp/dbt/dbt_project.yml    @elc-online/udp-mtm-domain-team @elc-online/udp-platform
+data/etp/dbt/profiles.yml       @elc-online/udp-mtm-domain-team @elc-online/udp-platform
+data/etp/dbt/macros/            @elc-online/udp-mtm-domain-team @elc-online/udp-platform
+
+# Manifests bind to the shared dag_factory schema.
+dags/                           @elc-online/udp-mtm-domain-team @elc-online/udp-platform
+
+# Composer runtime mirrors -- platform-owned, never deployed from this repo.
+logs/                           @elc-online/udp-platform
+plugins/                        @elc-online/udp-platform
+
+# Packaging and CI.
+pyproject.toml                  @elc-online/udp-mtm-domain-team @elc-online/udp-platform
+src/                            @elc-online/udp-mtm-domain-team @elc-online/udp-platform
+.github/workflows/              @elc-online/udp-mtm-domain-team @elc-online/udp-platform

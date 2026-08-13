@@ -1,0 +1,38 @@
+version: 2
+
+# Raw landing tables written by the mtm_ingestion Cloud Run job.
+# Must stay in sync with `tables:` in data/etp/configs/mtm__ingestion__configs.yaml --
+# adding a table there without adding it here means it never reaches the warehouse layer.
+
+sources:
+  - name: mtm_raw
+    database: mtm-dev-bronze-7b1f
+    schema: mtm_raw
+    description: Raw MTM API extracts landed by the mtm_ingestion job.
+
+    tables:
+      - name: transactions
+        description: Transaction records, merged on transaction_id each run.
+        loaded_at_field: updated_at
+        freshness:
+          warn_after: { count: 26, period: hour }
+          error_after: { count: 48, period: hour }
+        columns:
+          - name: transaction_id
+            description: Primary key of the transaction.
+            data_tests:
+              - not_null
+              - unique
+          - name: updated_at
+            description: Incremental cursor field used by the ingestion job.
+            data_tests:
+              - not_null
+
+      - name: accounts
+        description: Account dimension, fully replaced each run.
+        columns:
+          - name: account_id
+            description: Primary key of the account.
+            data_tests:
+              - not_null
+              - unique

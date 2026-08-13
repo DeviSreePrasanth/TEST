@@ -1,0 +1,132 @@
+name: Release (Prod)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options: [patch, minor, major]
+
+env:
+  # Two distinct projects -- see the note in deploy.yml. The registry is NOT in the
+  # orchestration project that hosts Composer.
+  COMPOSER_PROJECT_ID: ${{ vars.COMPOSER_PROJECT_ID }}
+  AR_REGION: ${{ vars.AR_REGION }}
+  AR_PROJECT_ID: ${{ vars.AR_PROJECT_ID }}
+  AR_REPO_NAME: ${{ vars.AR_REPO_NAME }}
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute next version and push tag
+        id: bump
+        run: |
+          LATEST=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          [ -z "$LATEST" ] && LATEST="v0.0.0"
+          MAJOR=$(echo "$LATEST" | cut -dv -f2 | cut -d. -f1)
+          MINOR=$(echo "$LATEST" | cut -d. -f2)
+          PATCH=$(echo "$LATEST" | cut -d. -f3)
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH+1)) ;;
+          esac
+          TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+  build-and-publish:
+    needs: tag
+    runs-on: ubuntu-latest
+    environment: prod   # blocks until a configured reviewer approves
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.tag.outputs.tag }}
+
+      # WIF provider / SA / project are identifiers, not secrets: declared as repository
+      # variables so they match the names deploy.yml uses.
+      - name: Authenticate to Google Cloud (WIF only)
+        uses: ./.github/actions/gcp-auth
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.COMPOSER_PROJECT_ID }}
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Verify prod variables exist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # These are prod-only and are NOT yet defined in the repository variables --
+          # only the dev set (COMPOSER_BUCKET, COMPOSER_PROJECT_ID, AR_*) exists today.
+          # Fail here with a clear message rather than pushing to `gs:///` or updating an
+          # empty-named environment.
+          missing=()
+          for name in COMPOSER_BUCKET_PROD COMPOSER_ENV_PROD COMPOSER_LOCATION; do
+            if [[ -z "${!name:-}" ]]; then missing+=("${name}"); fi
+          done
+
+          if (( ${#missing[@]} )); then
+            echo "::error::Prod release is not configured. Missing repository variables: ${missing[*]}"
+            exit 1
+          fi
+        env:
+          COMPOSER_BUCKET_PROD: ${{ vars.COMPOSER_BUCKET_PROD }}
+          COMPOSER_ENV_PROD: ${{ vars.COMPOSER_ENV_PROD }}
+          COMPOSER_LOCATION: ${{ vars.COMPOSER_LOCATION }}
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Publish to Artifact Registry (PyPI)
+        run: |
+          pip install twine keyring keyrings.google-artifactregistry-auth
+          twine upload \
+            --repository-url "https://${AR_REGION}-python.pkg.dev/${AR_PROJECT_ID}/${AR_REPO_NAME}/" \
+            dist/*.whl
+
+      - name: Push wheel to the Composer bucket
+        run: |
+          set -euo pipefail
+
+          WHEEL=$(ls dist/*.whl)
+          PREFIX="${{ vars.COMPOSER_WHEEL_PREFIX || 'wheels' }}"
+
+          # Mirrors deploy.yml: versioned copy plus a stable pointer for Terraform.
+          gcloud storage cp "${WHEEL}" "gs://${{ vars.COMPOSER_BUCKET_PROD }}/${PREFIX}/$(basename "${WHEEL}")"
+          gcloud storage cp "${WHEEL}" "gs://${{ vars.COMPOSER_BUCKET_PROD }}/${PREFIX}/etl_mtm-latest-py3-none-any.whl"
+
+      - name: Update Composer Prod environment
+        run: |
+          VERSION="${{ needs.tag.outputs.tag }}"
+          VERSION="${VERSION#v}"
+          gcloud composer environments update "${{ vars.COMPOSER_ENV_PROD }}" \
+            --location "${{ vars.COMPOSER_LOCATION }}" \
+            --project "${COMPOSER_PROJECT_ID}" \
+            --update-pypi-package "etl-mtm==${VERSION}"
+
+      - name: Create GitHub Release
+        run: gh release create "${{ needs.tag.outputs.tag }}" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etl-mtm"
+dynamic = ["version"]
+description = "UDP MTM domain package - DAG manifest entries, source configs, and dbt project for the MTM data pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [
+    { name = "UDP MTM Domain Team" }
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "dbt-bigquery>=1.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+# Needed only to run the DAG Factory alignment checks (tests/test_dag_factory_alignment.py
+# and scripts/validate_dag_factory.py). Kept out of `dev` because Airflow is a heavy install
+# and the rest of the suite does not need it. Pin to the Composer image's Airflow version --
+# validating against a different version can pass here and still fail in the environment.
+validation = [
+    "apache-airflow>=2.9,<3",
+    # The factory instantiates DatabricksSubmitRunOperator and BigQueryCheckOperator at
+    # DAG-build time. Those live in provider packages, not in core Airflow -- without them
+    # the factory fails on import and the alignment job never gets to assert anything.
+    "apache-airflow-providers-databricks>=6.0",
+    "apache-airflow-providers-google>=10.0",
+]
+
+[tool.setuptools-scm]
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"
+fallback_version = "0.1.0.dev0"
+
+# --- Packaging -------------------------------------------------------------------------
+#
+# `dags/` and `data/` live at the repository root so the checkout mirrors the Composer
+# bucket layout documented in structure.md. The wheel still has to expose them as package
+# data, so package-dir grafts both trees under the `etl_mtm` namespace: an installed copy
+# has them at site-packages/etl_mtm/{dags,data}. etl_mtm.__init__ resolves either location
+# at import time, so tests work the same in a checkout and in an installed wheel.
+#
+# Only the two mappings below are needed -- setuptools resolves nested packages by walking
+# up to the longest matching prefix (etl_mtm.data.etp.dbt -> data/etp/dbt).
+#
+# logs/ and plugins/ are deliberately absent: they are Composer runtime directories, not
+# shippable content.
+
+[tool.setuptools.package-dir]
+etl_mtm = "src/etl_mtm"
+"etl_mtm.dags" = "dags"
+"etl_mtm.data" = "data"
+
+[tool.setuptools]
+packages = [
+    "etl_mtm",
+    "etl_mtm.dags",
+    "etl_mtm.dags.manifests",
+    "etl_mtm.dags.templates",
+    "etl_mtm.data",
+    "etl_mtm.data.etp",
+    "etl_mtm.data.etp.configs",
+    "etl_mtm.data.etp.dbt",
+    "etl_mtm.data.etp.dbt.macros",
+    "etl_mtm.data.etp.dbt.models",
+    "etl_mtm.data.etp.dbt.models.mtm",
+    "etl_mtm.data.etp.dbt.models.mtm.staging",
+    "etl_mtm.data.etp.dbt.tests",
+]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml", "*.sql", "*.md", ".gitkeep"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["data/*/dbt/target", "data/*/dbt/dbt_packages"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

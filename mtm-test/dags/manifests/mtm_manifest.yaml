@@ -1,0 +1,52 @@
+# MTM domain manifest, consumed by dag_factory.py (deployed to dags/templates/).
+#
+# Schema follows etp-etl-core/dags/mtm/mtm_manifest.yaml, which is what the factory
+# actually parses. The factory discovers manifests with `dags/*/*_manifest.y*ml` and
+# requires a top-level `dags:` key -- an entry list under any other key is skipped with
+# "Manifest ... missing 'dags' key".
+#
+# Fields below and how the factory uses them (see dag_factory.py::_build_dag):
+#   dag_id              DAG id verbatim; convention is dsf_<domain>_<job>
+#   domain / wave       domain falls back to wave; used for params and job-config lookup
+#   job                 job name; with domain, resolves pipelines/<domain>/<job>/config.yml
+#   schedule            passed straight to DAG(schedule=...)
+#   tags                DAG tags; defaults to ["dsf", domain, job] if omitted
+#   enabled             false means no DAG is built at all
+#   runtime / runtimes  one ingest task, or an `ingest` TaskGroup when several
+#   dbt_selector        enables dbt_run + dbt_test; run_dbt defaults to bool(dbt_selector)
+#   dbt_project_dir     cd target for the dbt tasks, relative to $AIRFLOW_HOME
+#   verify_tables       one BigQueryCheckOperator per entry, inside a verify_tables group
+#   prerequisite_dags   ExternalTaskSensor per entry, gating the first task
+#   retries / retry_delay_minutes / sla_minutes   default_args and SLA callback
+#
+# Resulting task topology for this entry:
+#   ingest -> verify_tables.{verify_transactions, verify_accounts} -> dbt_run -> dbt_test
+
+generated_by: manual
+generated_from: etl-mtm/data/etp/configs/mtm__ingestion__configs.yaml
+
+dags:
+- dag_id: dsf_mtm_ingestion
+  domain: mtm
+  wave: mtm
+  job: ingestion
+  schedule: 0 6 * * *
+  tags:
+  - dsf
+  - mtm
+  - ingestion
+  - databricks_mirror
+  enabled: true
+  runtime: databricks_mirror
+  dbt_project_dir: dbt
+  dbt_selector: tag:mtm_ingestion
+  verify_tables:
+  - project: mtm-dev-bronze-7b1f
+    dataset: mtm_raw
+    table: transactions
+  - project: mtm-dev-bronze-7b1f
+    dataset: mtm_raw
+    table: accounts
+  retries: 2
+  retry_delay_minutes: 5
+  sla_minutes: 120

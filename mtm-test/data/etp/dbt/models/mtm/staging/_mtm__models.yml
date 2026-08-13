@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: stg_mtm__transactions
+    description: Cleaned, typed transaction records from the MTM API.
+    columns:
+      - name: transaction_id
+        description: Primary key.
+        data_tests:
+          - not_null
+          - unique
+      - name: account_id
+        description: Foreign key into stg_mtm__accounts.
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('stg_mtm__accounts')
+              field: account_id
+      - name: currency_code
+        description: Uppercased ISO-4217 currency code.
+        data_tests:
+          - not_null
+
+  - name: stg_mtm__accounts
+    description: Cleaned account dimension from the MTM API.
+    columns:
+      - name: account_id
+        description: Primary key.
+        data_tests:
+          - not_null
+          - unique
+      - name: account_status
+        description: Uppercased account status.
+        data_tests:
+          - accepted_values:
+              values: ["ACTIVE", "CLOSED", "SUSPENDED"]
