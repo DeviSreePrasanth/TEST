@@ -1,106 +1,141 @@
-# `gcloud storage rsync` — test scenarios
+# `gcloud storage rsync` — manual test steps
 
-Scratchpad for observing how rsync decides what to copy and what to delete.
+Local-only. No GitHub Actions, no WIF, no workflow.
 
-**Setup used below**
+## Setup
 
 ```bash
+cd c:/Users/prasanth.byreddi/Downloads/TEST
+
 SRC=mtm-test/dags
 DST=gs://elc-composer-udp-env-dev1/dags
 
-# Always preview first. --dry-run prints the decision without acting.
-plan() { gcloud storage rsync --recursive --dry-run "$@" "$SRC" "$DST"; }
-apply() { gcloud storage rsync --recursive "$@" "$SRC" "$DST"; }
-look() { gcloud storage ls --recursive --long "$DST/**"; }
+# generation changes on EVERY overwrite — the reliable "was it re-uploaded?" signal.
+# update_time alone is not enough to reason from.
+stamp() { gcloud storage objects describe "$DST/$1" --format="value(generation,update_time,md5_hash)"; }
+
+look()  { gcloud storage ls --long --recursive "$DST/**"; }
+plan()  { gcloud storage rsync --recursive --dry-run "$@" "$SRC" "$DST"; }
+sync()  { gcloud storage rsync --recursive "$@" "$SRC" "$DST"; }
 ```
 
 Reading the output:
 
 | Line | Meaning |
 |---|---|
-| `Would copy file://… to gs://…` | new **or** modified — will upload |
-| `Would remove gs://…` | in bucket, absent from source (only with the delete flag) |
-| *(no line for a file)* | unchanged — skipped |
+| `Would copy file://… to gs://…` | new **or** changed — will upload |
+| `Would remove gs://…` | in bucket, not in source (only with the delete flag) |
+| *(nothing for a file)* | unchanged — skipped |
 
-> On Windows you'll see `WARNING: The following characters are invalid…` / `Renaming …`
-> lines. Cosmetic — gcloud's temp tracker filenames. They do not appear on Linux runners.
-
----
-
-## Status legend
-
-- **[verified]** — observed live against `gs://elc-composer-udp-env-dev1`
-- **[untested]** — reason it wasn't run is noted; verify before relying on it
+> On Windows, ignore `WARNING: The following characters are invalid…` and `Renaming …`.
+> Cosmetic noise from gcloud's temp tracker filenames. Absent on Linux.
 
 ---
 
-## 1. New file added — [verified]
+# Part 1 — Verified scenarios
+
+All four were run live against `gs://elc-composer-udp-env-dev1` and behaved as recorded.
+
+## 1. New file is added ✅
 
 ```bash
-printf 'version: 1\n' > $SRC/probe.txt
-plan     # -> Would copy file://…/probe.txt to gs://…/dags/probe.txt
-apply
-look     # dags/probe.txt now present
+printf 'hello\n' > $SRC/test1.txt
+sync
+stamp test1.txt      # -> note the generation, call it A
+look                 # dags/test1.txt present
 ```
 
-**Observed:** one `Would copy` line; object created at the mirrored relative path.
+**Result:** uploaded. Path mirrors the source relative path —
 `mtm-test/dags/manifests/x.yaml` → `dags/manifests/x.yaml`.
 
-## 2. Existing file modified — [verified]
+## 2. Unmodified file is NOT re-uploaded ✅
 
 ```bash
-printf 'version: 2 CHANGED\n' > $SRC/probe.txt
-plan     # -> Would copy (same path)
-apply
-gcloud storage cat $DST/probe.txt   # -> version: 2 CHANGED
+sync                 # change nothing, just run it again
+stamp test1.txt      # -> generation B
 ```
 
-**Observed:** object overwritten in place. Same name, new content, new generation.
+**Result:** `A == B`. Generation unchanged, so the object was never rewritten.
 
-## 3. No change at all — [verified]
-
-```bash
-plan     # -> no copy lines
+```
+A = 1786620014994924
+B = 1786620014994924   <- identical
 ```
 
-**Observed:** rsync skipped everything. This is the baseline "clean" result.
+This is the behaviour you were asking about, and it holds.
 
-## 4. File deleted locally, **without** the delete flag — [verified]
+## 3. Modified file IS re-uploaded ✅
 
 ```bash
-rm $SRC/probe.txt
-plan                                  # -> nothing
-gcloud storage ls $DST/probe.txt      # -> STILL THERE
+printf 'hello CHANGED\n' > $SRC/test1.txt
+sync
+stamp test1.txt      # -> generation C
 ```
 
-**Observed: deletions do NOT propagate by default.** This is the single most
-important behaviour to internalise. Without `--delete-unmatched-destination-objects`
-rsync is additive only — the bucket accumulates orphans forever.
+**Result:** `C != A`. New generation, new `update_time`.
 
-## 5. File deleted locally, **with** the delete flag — [untested]
-
-```bash
-rm $SRC/probe.txt
-plan  --delete-unmatched-destination-objects
-apply --delete-unmatched-destination-objects
+```
+C = 1786620090204127   <- changed
 ```
 
-**Expected:** a `Would remove gs://…/probe.txt` line, then the object disappears.
-
-> Not confirmed live — the dry-run output didn't match the grep filter used, so the
-> exact wording is unverified. Run the plan step and note what it actually prints.
-
-## 6. File renamed — [untested]
+## 4. `touch` alone does NOT trigger an upload ✅
 
 ```bash
-git mv $SRC/probe.txt $SRC/probe-renamed.txt
+touch $SRC/test1.txt        # content identical, mtime bumped
+plan                        # -> no copy line
+```
+
+**Result:** skipped, despite the local mtime moving 52 seconds ahead of the mtime
+stored on the object (`goog-reserved-file-mtime`).
+
+**Why this matters:** rsync compares size and MD5, not just mtime. So
+`actions/checkout` rewriting mtimes on every CI run will **not** cause spurious
+re-uploads. `--checksums-only` is not needed for this.
+
+## 5. Deleting locally does NOT delete in the bucket ✅
+
+```bash
+rm $SRC/test1.txt
+plan                                    # -> nothing
+gcloud storage ls $DST/test1.txt        # -> STILL THERE
+```
+
+**Result:** without `--delete-unmatched-destination-objects`, rsync is **additive
+only**. Orphans accumulate in the bucket forever. Most important behaviour in this
+document.
+
+## 6. Empty directories produce nothing ✅
+
+`mtm-test/dags/templates/` is empty and created no object. GCS has no real
+directories, and git doesn't track empty ones either.
+
+---
+
+# Part 2 — Not yet verified
+
+Run these yourself; each notes what to look for.
+
+## 7. Delete with the flag
+
+```bash
+rm $SRC/test1.txt
 plan --delete-unmatched-destination-objects
 ```
 
-**Expected:** rsync has no rename concept — one `copy` (new name) plus one `remove`
-(old name). Without the delete flag you get **both** names in the bucket.
+Expect a removal line, then apply and confirm the object is gone. **Note the exact
+wording** — my grep filter missed it, so I can't tell you what it prints.
 
-## 7. Empty source directory + delete flag — [untested] ⚠️ DANGEROUS
+## 8. Rename
+
+```bash
+mv $SRC/test1.txt $SRC/test2.txt
+plan --delete-unmatched-destination-objects
+```
+
+rsync has no rename concept — expect one copy (new name) + one remove (old name).
+Without the delete flag you keep **both** names in the bucket.
+
+## 9. Empty source + delete flag ⚠️ DANGEROUS — dry-run only
 
 ```bash
 mkdir -p /tmp/empty
@@ -108,130 +143,76 @@ gcloud storage rsync --recursive --delete-unmatched-destination-objects \
   --dry-run /tmp/empty "$DST"
 ```
 
-**Expected: every object under the destination prefix is deleted.** Test with
-`--dry-run` only. This is the failure mode to fear in CI — if a path is wrong, a
-build step didn't produce output, or a directory is conditionally absent, a
-delete-sync silently wipes the prefix. Nothing warns you.
+Expect **every object under the prefix** to be marked for deletion. This is the CI
+failure mode to fear: a wrong path, a build step that produced no output, or a
+conditionally-absent directory silently wipes the prefix.
 
-## 8. Touch without changing content — [untested]
+## 10. Exclude + delete flag ⚠️ VERIFY BEFORE RELYING ON IT
 
-```bash
-touch $SRC/probe.txt
-plan
-```
-
-**Expected: a copy, despite identical content.** rsync compares **size + mtime**, not
-content. Since `actions/checkout` rewrites mtimes on every run, expect CI to re-upload
-everything on every build. Compare against:
+Does `--exclude` protect matching objects **already in the destination** from being
+deleted, or does it only filter the source listing — making those objects look
+"unmatched" and therefore deletable?
 
 ```bash
-plan --checksums-only    # should skip — compares content hashes instead
-```
-
-Worth measuring if the synced tree is large; `--checksums-only` costs local CPU but
-avoids pointless uploads.
-
-## 9. Exclude pattern + delete flag — [untested] ⚠️ VERIFY THIS ONE
-
-```bash
-# seed the bucket with something the exclude will later hide
-gcloud storage rsync --recursive $SRC $DST
-
-# now sync again, excluding it, WITH delete
 plan --delete-unmatched-destination-objects --exclude='(^|/)target/'
 ```
 
-**The question:** does `--exclude` protect matching objects *in the destination* from
-deletion, or does the exclude only filter the *source* listing — making excluded
-destination objects look "unmatched" and therefore deletable?
+I attempted this live and the command was blocked (it needed to recursively clear a
+scratch prefix that hadn't been authorised). **Unresolved, and it directly affects the
+`dbt_exclude` in your sync function.** Test in a throwaway bucket.
 
-I attempted to verify this live and the command was blocked (it required recursively
-clearing a scratch prefix that hadn't been explicitly authorised). **It remains an open
-question and it directly affects the `sync()` function below.** Test it in a throwaway
-bucket before trusting the exclude to protect anything.
-
-## 10. New nested directory — [untested]
+## 11. Drift — object edited in the bucket only
 
 ```bash
-mkdir -p $SRC/newdir/sub && printf 'x\n' > $SRC/newdir/sub/f.txt
+echo 'edited in gcs' | gcloud storage cp - $DST/test1.txt
 plan
 ```
 
-**Expected:** copied. GCS has no real directories, so depth costs nothing and no
-directory needs pre-creating. Contrast with the **wheel** path, where a new directory
-must be added to `packages` in `pyproject.toml` or it is silently dropped.
+rsync is one-way; expect your bucket edit to be overwritten from source. Don't
+hand-edit objects under a synced prefix.
 
-## 11. Empty directory — [verified, incidentally]
-
-`mtm-test/dags/templates/` is empty and produced **no** object. Empty directories are
-not representable in GCS and are not tracked by git either. Anything relying on a
-directory existing will not find it.
-
-## 12. Drift — object changed in the bucket only — [untested]
+## 12. Trailing slashes
 
 ```bash
-echo 'edited directly in gcs' | gcloud storage cp - $DST/probe.txt
-plan
+plan    # SRC=mtm-test/dags   DST=gs://…/dags
+plan    # SRC=mtm-test/dags/  DST=gs://…/dags/
 ```
 
-**Expected:** rsync is one-way. If the sizes differ it re-copies from source and your
-bucket edit is lost. If the size happens to match, mtime decides. Do not hand-edit
-objects under a synced prefix.
-
-## 13. Trailing slashes — [untested]
-
-```bash
-plan   # with SRC=mtm-test/dags   and DST=gs://…/dags
-plan   # with SRC=mtm-test/dags/  and DST=gs://…/dags/
-```
-
-**Expected:** equivalent for `gcloud storage rsync` (unlike Unix `rsync`, where the
-trailing slash on the source is load-bearing). Confirm rather than assume — getting it
-wrong nests the tree one level deeper, e.g. `dags/dags/manifests/…`.
-
----
-
-## Notes on the `sync()` function you shared
-
-Reviewing the snippet against this repo:
-
-**1. `${DOMAIN}` is never defined.** The `env:` block sets only `COMPOSER_BUCKET`. With
-`set -u` active the function dies on first use — loudly, at least, but it will not run
-as written.
-
-**2. The source paths don't match this repo's layout.** The snippet syncs `configs/`
-and `dbt/` from the repo root; here they live at `data/etp/configs/` and
-`data/etp/dbt/`. See [pyproject.toml](mtm-test/pyproject.toml).
-
-**3. Per-domain delete scoping is the right call.** Because each destination is
-`…/${DOMAIN}/`, the delete flag can only ever remove that one domain's objects. Other
-domains sharing the bucket are structurally protected. Good design — keep it.
-
-**4. Preview-then-apply runs rsync twice.** Correct and worth the cost, but note the
-two invocations are not atomic: the preview reflects bucket state at time T, the apply
-acts at T+n. On a bucket with concurrent writers they can disagree.
-
-**5. Scenario 7 is the live risk.** Three delete-syncs, each pointed at a source
-directory that must exist and be populated. If `dbt/` is ever missing or empty, that
-prefix is emptied in the bucket. Consider guarding each call:
-
-```bash
-if [[ -z "$(find "${src}" -type f -print -quit 2>/dev/null)" ]]; then
-  echo "::error::${src} is empty or missing — refusing to delete-sync ${dst}"
-  return 1
-fi
-```
-
-**6. Scenario 9 is unresolved and applies directly to `dbt_exclude`.** If `--exclude`
-does not shield destination objects, the delete flag will remove anything already in
-the bucket under `target/`, `logs/`, or `dbt_packages/`. Probably desirable here —
-those are build artefacts — but confirm it's what actually happens.
+Expect equivalence (unlike Unix `rsync`, where the source trailing slash is
+load-bearing). Confirm — getting it wrong nests as `dags/dags/manifests/…`.
 
 ---
 
 ## Cleanup
 
 ```bash
-gcloud storage rm --recursive gs://elc-composer-udp-env-dev1/dags
-git checkout -- mtm-test/dags/
+rm -f $SRC/test1.txt $SRC/test2.txt
+gcloud storage rm $DST/test1.txt $DST/test2.txt
+```
+
+---
+
+# Part 3 — Notes on your `sync()` function
+
+**`${DOMAIN}` is never defined.** The `env:` block sets only `COMPOSER_BUCKET`. With
+`set -u` the function dies on first call.
+
+**Source paths don't match this repo.** The snippet syncs `configs/` and `dbt/` from
+the root; here they are at `data/etp/configs/` and `data/etp/dbt/`.
+
+**Per-domain delete scoping is correct — keep it.** Because each destination ends in
+`/${DOMAIN}/`, the delete flag can only ever touch that one domain. Other domains
+sharing the bucket are structurally protected.
+
+**Preview-then-apply runs rsync twice.** Worth the cost, but not atomic — the preview
+reflects state at T, the apply acts at T+n.
+
+**Guard against scenario 9.** Three delete-syncs, each assuming its source exists and
+is populated:
+
+```bash
+if [[ -z "$(find "${src}" -type f -print -quit 2>/dev/null)" ]]; then
+  echo "::error::${src} is empty or missing — refusing to delete-sync ${dst}"
+  return 1
+fi
 ```
