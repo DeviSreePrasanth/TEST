@@ -22,6 +22,8 @@
 # Resulting task topology for this entry:
 #   ingest -> verify_tables.{verify_transactions, verify_accounts} -> dbt_run -> dbt_test
 
+
+
 generated_by: manual
 generated_from: etl-mtm/data/etp/configs/mtm__ingestion__configs.yaml
 

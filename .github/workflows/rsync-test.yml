@@ -1,0 +1,156 @@
+name: Rsync test
+
+# Standalone experiment: prove out how `gcloud storage rsync` decides what to copy and what
+# to delete. Nothing else -- no wheel, no Artifact Registry, no Composer update. Change one
+# file under mtm-test/dags/, push, and read the "Plan" step to see exactly what rsync chose.
+#
+# NOTE: this sits at the repository root on purpose. Actions only reads .github/workflows/
+# from the root, so the workflows under mtm-test/.github/workflows/ are never registered.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "mtm-test/dags/**"
+      - ".github/workflows/rsync-test.yml"
+  workflow_dispatch:
+    inputs:
+      delete_extras:
+        description: >
+          Also delete bucket objects that no longer exist in the repo (rsync -d).
+          DESTRUCTIVE and not reversible -- off by default, and never on for a plain push.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: rsync-test
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: dsf-prod-poc
+  BUCKET: elc-composer-udp-env-dev1
+  # Local path -> bucket prefix. The trailing layout matters: rsync mirrors the *contents*
+  # of SOURCE into DEST, so mtm-test/dags/manifests/x.yaml lands at dags/manifests/x.yaml.
+  SOURCE: mtm-test/dags
+  DEST_PREFIX: dags
+
+jobs:
+  rsync:
+    name: Sync dags/ and report the diff
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF only)
+        uses: ./mtm-test/.github/actions/gcp-auth
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Preflight -- can this identity reach the bucket?
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The service account is defined in eo-devops-aa51 but the bucket lives in
+          # ${PROJECT_ID}. Cross-project access is not automatic, so fail here with a
+          # readable message instead of a bare 403 halfway through a sync.
+          if ! gcloud storage buckets describe "gs://${BUCKET}" \
+                 --project "${PROJECT_ID}" \
+                 --format="value(name)" >/dev/null 2>&1; then
+            echo "::error::Cannot read gs://${BUCKET} as this identity."
+            echo "Grant roles/storage.objectAdmin on the bucket to:"
+            echo "  ${{ vars.GCP_SERVICE_ACCOUNT }}"
+            exit 1
+          fi
+
+          echo "Bucket reachable: gs://${BUCKET} (project ${PROJECT_ID})"
+
+      - name: Before -- what is in the bucket right now
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== gs://${BUCKET}/${DEST_PREFIX}/ =="
+          gcloud storage ls --recursive "gs://${BUCKET}/${DEST_PREFIX}/**" || echo "(empty)"
+
+          echo ""
+          echo "== local ${SOURCE}/ =="
+          find "${SOURCE}" -type f | sort
+
+      - name: Plan -- what rsync would do (dry run)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The whole point of this workflow. --dry-run prints one line per decision:
+          #   Copying file://...   -> new or modified, will be uploaded
+          #   Removing gs://...    -> present in the bucket, absent from the repo
+          #   (no line)            -> unchanged, skipped
+          #
+          # rsync compares size and mtime, NOT content, unless --checksums-only is passed.
+          # Touching a file without changing it can therefore still trigger a copy.
+          DELETE_FLAG=""
+          if [[ "${{ inputs.delete_extras }}" == "true" ]]; then
+            DELETE_FLAG="--delete-unmatched-destination-objects"
+          fi
+
+          gcloud storage rsync \
+            --recursive \
+            --dry-run \
+            ${DELETE_FLAG} \
+            "${SOURCE}" \
+            "gs://${BUCKET}/${DEST_PREFIX}" 2>&1 | tee plan.txt
+
+          if [[ ! -s plan.txt ]]; then
+            echo "(rsync found nothing to do -- source and destination already match)"
+          fi
+
+      - name: Apply -- run the real rsync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DELETE_FLAG=""
+          if [[ "${{ inputs.delete_extras }}" == "true" ]]; then
+            echo "::warning::Deleting bucket objects that are absent from the repo."
+            DELETE_FLAG="--delete-unmatched-destination-objects"
+          fi
+
+          gcloud storage rsync \
+            --recursive \
+            ${DELETE_FLAG} \
+            "${SOURCE}" \
+            "gs://${BUCKET}/${DEST_PREFIX}"
+
+      - name: After -- confirm the bucket reflects the change
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud storage ls --recursive --long "gs://${BUCKET}/${DEST_PREFIX}/**"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Rsync test"
+            echo ""
+            echo "- Source: \`${SOURCE}/\`"
+            echo "- Destination: \`gs://${BUCKET}/${DEST_PREFIX}/\`"
+            echo "- Delete extras: \`${{ inputs.delete_extras || 'false' }}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo ""
+            echo "### What rsync decided"
+            echo ""
+            echo '```'
+            cat plan.txt 2>/dev/null || echo "(plan step did not run)"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
