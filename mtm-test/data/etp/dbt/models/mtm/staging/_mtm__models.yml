@@ -1,5 +1,7 @@
 version: 2
 
+
+
 models:
   - name: stg_mtm__transactions
     description: Cleaned, typed transaction records from the MTM API.
