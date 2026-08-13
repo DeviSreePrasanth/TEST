@@ -13,6 +13,7 @@ on:
       - main
     paths:
       - "mtm-test/dags/**"
+      - "mtm-test/data/etp/**"
       - ".github/workflows/rsync-test.yml"
   workflow_dispatch:
     inputs:
@@ -63,12 +64,19 @@ jobs:
           # The service account is defined in eo-devops-aa51 but the bucket lives in
           # ${PROJECT_ID}. Cross-project access is not automatic, so fail here with a
           # readable message instead of a bare 403 halfway through a sync.
-          if ! gcloud storage buckets describe "gs://${BUCKET}" \
-                 --project "${PROJECT_ID}" \
-                 --format="value(name)" >/dev/null 2>&1; then
-            echo "::error::Cannot read gs://${BUCKET} as this identity."
-            echo "Grant roles/storage.objectAdmin on the bucket to:"
-            echo "  ${{ vars.GCP_SERVICE_ACCOUNT }}"
+          #
+          # Probe with `ls`, not `buckets describe`: describe needs storage.buckets.get,
+          # which roles/storage.objectAdmin does NOT include. Listing objects needs only
+          # storage.objects.list, so this tests the permission rsync actually uses.
+          # An empty bucket still exits 0 here -- only a missing bucket or a denial fails.
+          if ! gcloud storage ls "gs://${BUCKET}/" \
+                 --project "${PROJECT_ID}" >/dev/null 2>err.txt; then
+            echo "::error::Cannot access gs://${BUCKET} as this identity."
+            sed 's/^/  /' err.txt
+            echo ""
+            echo "If the bucket does not exist, rsync will NOT create it -- create it first."
+            echo "If this is a permission denial, grant roles/storage.objectAdmin on the"
+            echo "bucket to: ${{ vars.GCP_SERVICE_ACCOUNT }}"
             exit 1
           fi
 
